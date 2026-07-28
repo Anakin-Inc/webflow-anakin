@@ -2,7 +2,7 @@
   "name": "webflow-anakin",
   "version": "1.0.0",
   "private": true,
-  "description": "Webflow Data Client (OAuth app): lets a site owner pick a CMS collection and a source URL, scrapes the URL with Anakin (generateJson), and writes the extracted structured data into a new Webflow CMS collection item via the Data API v2.",
+  "description": "Webflow Data Client (OAuth app): lets a site owner pick a CMS collection and a source URL, scrapes the URL with Anakin (generateJson), and writes the extracted structured data into a new Webflow CMS collection item via the Data API v2. Also exposes Anakin's map/crawl/Wire/AI Visibility/sessions/monitors APIs for site discovery, bulk import, and change tracking.",
   "main": "server.js",
   "engines": {
     "node": ">=18"

@@ -10,18 +10,40 @@ identity, a deployed host, and a Workspace they administer.
 ## What's here
 
 ```
-server.js               Express server: OAuth routes, /api/*, /api/extract
+server.js               Express server: OAuth routes, /api/*, /api/extract, /api/discover/*, /api/wire/*, /api/ai-visibility/*, /api/sessions, /api/monitors*
 lib/webflow-auth.js        Authorize-URL builder + token exchange (Webflow OAuth)
 lib/oauth-state.js          CSRF state: mint / verify-and-consume
 lib/session.js                Opaque session cookie
 lib/token-store.js             AES-256-GCM token encryption + swappable backend
 lib/webflow-client.js           Webflow Data API v2 client
-lib/anakin-client.js              Anakin API client
+lib/anakin-client.js              Anakin API client (scrape, search, agentic-search, map, crawl, wire*, aiVisibility*, sessionsList, monitor*)
 lib/extraction.js                  generatedJson -> Webflow fieldData mapping
-test/*.test.js           node:test unit tests (44 total)
+test/*.test.js           node:test unit tests (87 total, 6 files)
 scripts/smoke-test.js     Starts the real server, drives the real OAuth HTTP flow
 package.json, .env.example, .gitignore
 ```
+
+## API surface: from 3 capabilities to 14 of 21
+
+This row started covering 3 of Anakin's 21 REST capabilities (`scrape` via
+`POST /api/extract`; `search`/`agentic-search` implemented in
+`lib/anakin-client.js` but not wired to a route). This pass extends the
+surface to 11 more — `map`, `crawl`, `wire_discover`, `wire_catalog`,
+`wire_read_action`, `ai_visibility_sources`, `ai_visibility_search`,
+`session_list`, `monitor_create`, `monitor_list`, `monitor_changes` — chosen
+because each plausibly serves this app's CMS-population use case: site
+discovery before a bulk import, structured extraction from Anakin's
+pre-built site catalog, AI-visibility content for a marketing collection,
+and change tracking for already-imported pages. Every new route reuses the
+existing `requireInstallation` auth gate (same cookie -> `TokenStore`
+lookup) without any change to `lib/oauth-state.js` or `lib/token-store.js`.
+
+Deliberately excluded: `wire_write_action`/`wire_login`/`wire_build` (state-
+changing or credential-establishing — wrong shape for an unattended read
+pipeline), `session_delete` (destructive, not needed to read CMS content),
+`browser_task` (open-ended, no bounded CMS-population output). Full
+reasoning and the per-route table are in README's "Extended Anakin API
+coverage."
 
 ## Real Webflow OAuth / Data Client structure — confirmed live, not guessed
 
@@ -88,7 +110,7 @@ scratch this pass, not taken on a prior run's word):
 
 - `npm install` — succeeds (`express`, `cookie`, `dotenv` from the npm
   registry).
-- `npm test` — **44/44 unit tests pass**, `node:test`:
+- `npm test` — **87/87 unit tests pass**, `node:test`:
   - `test/oauth-state.test.js` (15) — CSRF `state` verification: valid
     accepted; tampered (single char flipped) rejected; unrelated
     attacker-supplied state rejected; state valid for a *different* session
@@ -108,6 +130,22 @@ scratch this pass, not taken on a prior run's word):
     live call in this file); error/missing-`access_token` handling.
   - `test/extraction.test.js` (10) — allowlisted field mapping, schema
     building, name/slug fallback logic.
+  - `test/anakin-client.test.js` (24, new this pass) — the 11 newly added
+    Anakin client methods' request shaping and job-polling behavior against
+    an injected fetch (map/crawl submit+poll, Wire sync GET + async
+    submit/poll, AI Visibility poll-until-not-running incl. returning a
+    terminal "failed" rather than throwing, sessions, monitors), plus
+    `redactSecrets`.
+  - `test/server.test.js` (19, new this pass) — the 11 new routes' wiring
+    against a real Express app on a real socket (fake `global.fetch` only):
+    the `requireInstallation` 401 gate still applies to the new routes,
+    input validation (missing required fields, `maxPages` ceiling,
+    `intervalMinutes` minimum), `alertWebhookSecret` redaction reaching the
+    actual HTTP response body, and downstream Anakin errors surfacing as
+    502 instead of crashing the process.
+  - **The four pre-existing test files are byte-for-byte unmodified by this
+    pass** — same 44 tests, same assertions, confirming the CSRF/token-
+    security work wasn't touched while extending the API surface.
 - **The CSRF `state` check was actually exercised end-to-end against the
   real Webflow token endpoint, not bypassed**: `npm run smoke` starts the
   real `server.js` as a child process and drives the real
@@ -152,7 +190,11 @@ scratch this pass, not taken on a prior run's word):
   request/response shapes are transcribed from `anakin-py`'s real
   `client.py`/`models.py` source (same standard as this session's other
   Anakin integrations), but never confirmed against a live `200` from
-  `api.anakin.io`.
+  `api.anakin.io`. Same caveat for the 11 capabilities added in this pass
+  (`map`/`crawl`/`wire*`/`aiVisibility*`/`sessionsList`/`monitor*`) — their
+  shapes are transcribed from Anakin's own MCP server source
+  (`anakin-mcp/src/client.ts`, `src/tools/*.ts`) and covered by injected-
+  fetch unit tests, but never hit against the live API either.
 - **No Marketplace listing was drafted or submitted.** That needs: the app
   registered under a real Workspace, 2FA enabled on the submitting admin
   account, a deployed and publicly reachable host, a demo account or demo
