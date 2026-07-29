@@ -11,7 +11,7 @@ const { createPendingAuthorization, verifyAndConsumeState } = require("./lib/oau
 const { buildAuthorizeUrl, exchangeCodeForToken } = require("./lib/webflow-auth");
 const { WebflowClient } = require("./lib/webflow-client");
 const { TokenStore } = require("./lib/token-store");
-const { AnakinClient } = require("./lib/anakin-client");
+const { AnakinClient, redactSecrets } = require("./lib/anakin-client");
 const { buildExtractionSchema, mapToFieldData } = require("./lib/extraction");
 
 const PORT = process.env.PORT || 3000;
@@ -25,6 +25,15 @@ const ANAKIN_API_KEY = process.env.ANAKIN_API_KEY;
 const ANAKIN_BASE_URL = process.env.ANAKIN_BASE_URL || "https://api.anakin.io/v1";
 
 const INSTALLATION_COOKIE = "wf_anakin_installation";
+
+// This app's own ceiling on POST /api/discover/crawl's maxPages, tighter
+// than Anakin's own 1-500 range. Anakin's /crawl job is polled synchronously
+// (this Express request stays open for the whole poll, up to pollTimeoutMs),
+// and many hosts enforce a proxy/idle timeout well under that — see
+// README's "Known limitations". A future version should return 202 + a
+// poll endpoint instead of holding the connection open; until then, keep
+// worst-case latency bounded.
+const MAX_CRAWL_PAGES = 50;
 
 function log(...args) {
   // eslint-disable-next-line no-console
@@ -53,6 +62,15 @@ const counters = { tokenExchangeAttempts: 0 };
 
 function buildAnakinClient() {
   return new AnakinClient({ apiKey: ANAKIN_API_KEY, baseUrl: ANAKIN_BASE_URL });
+}
+
+/** Shared 500 guard for every route below that calls Anakin. Returns false (and has already responded) if misconfigured. */
+function requireAnakinApiKey(res) {
+  if (!ANAKIN_API_KEY) {
+    res.status(500).json({ error: "server_misconfigured", message: "ANAKIN_API_KEY is not set" });
+    return false;
+  }
+  return true;
 }
 
 function readInstallationId(req) {
@@ -257,6 +275,330 @@ app.post("/api/extract", requireInstallation, async (req, res) => {
   } catch (err) {
     logError("extract failed:", err.message);
     res.status(502).json({ error: "extraction_failed", message: err.message });
+  }
+});
+
+// ─── Anakin capability passthrough routes ──────────────────────────────────
+//
+// Extends this app's API surface beyond scrape (POST /api/extract) to the
+// rest of Anakin's REST API that plausibly serves a CMS-population use
+// case: site-structure discovery (map/crawl), structured extraction from
+// Anakin's pre-built site catalog (Wire read actions), AI-answer-engine
+// content research (AI Visibility), and change tracking for already-
+// imported source pages (monitors). Every route below is gated behind the
+// same `requireInstallation` middleware as the Webflow-backed routes above
+// — even though these specific calls only need `ANAKIN_API_KEY`, not the
+// Webflow access token — so the auth boundary for this server stays a
+// single, consistent pattern (an unauthenticated caller can't reach any
+// /api/* route and spend this deployment's Anakin credits) rather than
+// splitting into "routes that need a Webflow installation" vs "routes that
+// don't." None of this touches lib/oauth-state.js or lib/token-store.js.
+//
+// Deliberately NOT added (see README for the full reasoning):
+//   - wire_write_action, wire_login, wire_build — state-changing or
+//     credential-establishing Wire operations; out of scope for an
+//     unattended CMS-population pipeline.
+//   - session_delete — destructive, and not needed to *read* CMS content.
+//   - browser_task — open-ended agentic browser automation; no bounded
+//     CMS-population shape.
+
+/**
+ * POST /api/discover/map — body { url, limit?, depth?, limitPerLevel?,
+ * includeSubdomains?, includeExternalLinks?, useBrowser?, search? }.
+ * Discovers a site's reachable URLs, so a site owner can see what a bulk
+ * import would cover before spending Anakin credits and Webflow API calls
+ * scraping every page individually.
+ */
+app.post("/api/discover/map", requireInstallation, async (req, res) => {
+  const { url, limit, depth, limitPerLevel, includeSubdomains, includeExternalLinks, useBrowser, search } = req.body || {};
+  if (!url || typeof url !== "string") {
+    res.status(400).json({ error: "missing_url" });
+    return;
+  }
+  if (!requireAnakinApiKey(res)) return;
+
+  try {
+    const anakin = buildAnakinClient();
+    const opts = {};
+    if (limit !== undefined) opts.limit = limit;
+    if (depth !== undefined) opts.depth = depth;
+    if (limitPerLevel !== undefined) opts.limitPerLevel = limitPerLevel;
+    if (includeSubdomains !== undefined) opts.includeSubdomains = includeSubdomains;
+    if (includeExternalLinks !== undefined) opts.includeExternalLinks = includeExternalLinks;
+    if (useBrowser !== undefined) opts.useBrowser = useBrowser;
+    if (search !== undefined) opts.search = search;
+
+    const result = await anakin.map(url, opts);
+    res.json({
+      url: result.url,
+      links: result.links,
+      totalLinks: result.totalLinks,
+      externalLinks: result.externalLinks,
+      totalExternalLinks: result.totalExternalLinks,
+      durationMs: result.durationMs,
+    });
+  } catch (err) {
+    logError("map failed:", err.message);
+    res.status(502).json({ error: "anakin_api_error", message: err.message });
+  }
+});
+
+/**
+ * POST /api/discover/crawl — body { url, maxPages?, depth?, country?,
+ * useBrowser?, includePatterns?, excludePatterns?, sessionId?,
+ * sessionName? }. Bulk-fetches page markdown across a site — a preview
+ * step ahead of turning pages into CMS items (each page can then be run
+ * through POST /api/extract individually, so the AI-extracted fieldData
+ * mapping keeps going through extraction.js's collection-schema allowlist
+ * rather than being written unvalidated from crawl output).
+ */
+app.post("/api/discover/crawl", requireInstallation, async (req, res) => {
+  const { url, maxPages, depth, country, useBrowser, includePatterns, excludePatterns, sessionId, sessionName } = req.body || {};
+  if (!url || typeof url !== "string") {
+    res.status(400).json({ error: "missing_url" });
+    return;
+  }
+  if (maxPages !== undefined && (typeof maxPages !== "number" || maxPages > MAX_CRAWL_PAGES || maxPages < 1)) {
+    res.status(400).json({
+      error: "maxPages_out_of_range",
+      message: `maxPages must be a number between 1 and ${MAX_CRAWL_PAGES} (this app's own ceiling, tighter than Anakin's, since the request is held open for the whole poll).`,
+    });
+    return;
+  }
+  if (!requireAnakinApiKey(res)) return;
+
+  try {
+    const anakin = buildAnakinClient();
+    const opts = { country: country || "us", useBrowser: !!useBrowser };
+    if (maxPages !== undefined) opts.maxPages = maxPages;
+    if (depth !== undefined) opts.depth = depth;
+    if (includePatterns !== undefined) opts.includePatterns = includePatterns;
+    if (excludePatterns !== undefined) opts.excludePatterns = excludePatterns;
+    if (sessionId !== undefined) opts.sessionId = sessionId;
+    if (sessionName !== undefined) opts.sessionName = sessionName;
+
+    const result = await anakin.crawl(url, opts);
+    res.json({
+      url: result.url,
+      totalPages: result.totalPages,
+      completedPages: result.completedPages,
+      pages: result.pages,
+      durationMs: result.durationMs,
+    });
+  } catch (err) {
+    logError("crawl failed:", err.message);
+    res.status(502).json({ error: "anakin_api_error", message: err.message });
+  }
+});
+
+/**
+ * GET /api/wire/discover?q=&limit= — natural-language intent -> ranked
+ * candidate Wire actions. First step before pulling structured data from
+ * one of Anakin's pre-built site integrations into a CMS collection.
+ */
+app.get("/api/wire/discover", requireInstallation, async (req, res) => {
+  const q = typeof req.query.q === "string" ? req.query.q : undefined;
+  if (!q) {
+    res.status(400).json({ error: "missing_q" });
+    return;
+  }
+  if (!requireAnakinApiKey(res)) return;
+
+  try {
+    const anakin = buildAnakinClient();
+    const limit = req.query.limit !== undefined ? Number(req.query.limit) : undefined;
+    const result = await anakin.wireResolve(q, { limit });
+    res.json(result);
+  } catch (err) {
+    logError("wire discover failed:", err.message);
+    res.status(502).json({ error: "anakin_api_error", message: err.message });
+  }
+});
+
+/**
+ * GET /api/wire/catalog and GET /api/wire/catalog/:slug — browse Wire's
+ * catalog of pre-built site integrations (no slug: every catalog + action
+ * count; with slug: that site's full action list + param schemas).
+ */
+app.get("/api/wire/catalog", requireInstallation, async (_req, res) => {
+  if (!requireAnakinApiKey(res)) return;
+  try {
+    const anakin = buildAnakinClient();
+    const result = await anakin.wireCatalog();
+    res.json(result);
+  } catch (err) {
+    logError("wire catalog failed:", err.message);
+    res.status(502).json({ error: "anakin_api_error", message: err.message });
+  }
+});
+
+app.get("/api/wire/catalog/:slug", requireInstallation, async (req, res) => {
+  if (!requireAnakinApiKey(res)) return;
+  try {
+    const anakin = buildAnakinClient();
+    const result = await anakin.wireCatalog(req.params.slug);
+    res.json(result);
+  } catch (err) {
+    logError("wire catalog failed:", err.message);
+    res.status(502).json({ error: "anakin_api_error", message: err.message });
+  }
+});
+
+/**
+ * POST /api/wire/read-action — body { actionId, params? }. Runs a Wire
+ * READ action only (extracts data; never changes state on the target
+ * site) — see the file-header note on why wire_write_action is not
+ * exposed here. `actionId` must be a "read"-type action per
+ * GET /api/wire/discover or GET /api/wire/catalog/:slug's action list;
+ * this route does not itself verify the type (that check lives in Wire's
+ * catalog metadata, which the caller inspects before calling this).
+ */
+app.post("/api/wire/read-action", requireInstallation, async (req, res) => {
+  const { actionId, params, credentialId, identityId } = req.body || {};
+  if (!actionId || typeof actionId !== "string") {
+    res.status(400).json({ error: "missing_actionId" });
+    return;
+  }
+  if (!requireAnakinApiKey(res)) return;
+
+  try {
+    const anakin = buildAnakinClient();
+    const result = await anakin.wireRun(actionId, params || {}, { credentialId, identityId });
+    res.json(result);
+  } catch (err) {
+    logError("wire read-action failed:", err.message);
+    res.status(502).json({ error: "anakin_api_error", message: err.message });
+  }
+});
+
+/**
+ * GET /api/ai-visibility/sources — the roster of AI answer engines
+ * available to POST /api/ai-visibility/search.
+ */
+app.get("/api/ai-visibility/sources", requireInstallation, async (_req, res) => {
+  if (!requireAnakinApiKey(res)) return;
+  try {
+    const anakin = buildAnakinClient();
+    const result = await anakin.aiVisibilitySources();
+    res.json(result);
+  } catch (err) {
+    logError("ai-visibility sources failed:", err.message);
+    res.status(502).json({ error: "anakin_api_error", message: err.message });
+  }
+});
+
+/**
+ * POST /api/ai-visibility/search — body { query, sources?, country?,
+ * includeFullContent? }. Asks multiple AI answer engines the same
+ * question and compares their answers — useful for a marketing/SEO CMS
+ * collection that publishes AI-visibility findings as content. Each
+ * engine's raw `full_content` is large and stripped by default, matching
+ * Anakin's own MCP tool; pass `includeFullContent: true` to keep it.
+ */
+app.post("/api/ai-visibility/search", requireInstallation, async (req, res) => {
+  const { query, sources, country, includeFullContent } = req.body || {};
+  if (!query || typeof query !== "string") {
+    res.status(400).json({ error: "missing_query" });
+    return;
+  }
+  if (!requireAnakinApiKey(res)) return;
+
+  try {
+    const anakin = buildAnakinClient();
+    const search = await anakin.aiVisibilitySearch(query, { sources, country });
+    const results = (search.results || []).map((r) => {
+      if (includeFullContent) return r;
+      const { full_content: _dropped, ...rest } = r;
+      return rest;
+    });
+    res.json({
+      search_id: search.search_id,
+      status: search.status,
+      country: search.country,
+      synthesis: search.synthesis,
+      results,
+    });
+  } catch (err) {
+    logError("ai-visibility search failed:", err.message);
+    res.status(502).json({ error: "anakin_api_error", message: err.message });
+  }
+});
+
+/**
+ * GET /api/sessions?domain= — list saved browser sessions (encrypted
+ * login states), whose ids are usable as `sessionId` on
+ * POST /api/discover/crawl for login-protected source pages. Creating a
+ * session is intentionally not exposed (it's an interactive dashboard
+ * flow — see lib/anakin-client.js's header); this route only supports
+ * discovery.
+ */
+app.get("/api/sessions", requireInstallation, async (req, res) => {
+  if (!requireAnakinApiKey(res)) return;
+  try {
+    const anakin = buildAnakinClient();
+    const domain = typeof req.query.domain === "string" ? req.query.domain : undefined;
+    const result = await anakin.sessionsList(domain);
+    res.json(result);
+  } catch (err) {
+    logError("sessions list failed:", err.message);
+    res.status(502).json({ error: "anakin_api_error", message: err.message });
+  }
+});
+
+/**
+ * POST /api/monitors — body { url, intervalMinutes, ... }. Creates a
+ * scheduled watcher on a source page. Natural fit for keeping a CMS item
+ * fresh after the initial POST /api/extract import, though this
+ * integration does not (yet) wire a monitor's change alerts back into an
+ * automatic Webflow item update — see README's "Not implemented" note.
+ * The response is redacted (redactSecrets) before it ever reaches the
+ * browser: monitors carry a one-time `alertWebhookSecret`.
+ */
+app.post("/api/monitors", requireInstallation, async (req, res) => {
+  const { url, intervalMinutes, ...rest } = req.body || {};
+  if (!url || typeof url !== "string") {
+    res.status(400).json({ error: "missing_url" });
+    return;
+  }
+  if (!intervalMinutes || typeof intervalMinutes !== "number" || intervalMinutes < 15) {
+    res.status(400).json({ error: "invalid_intervalMinutes", message: "intervalMinutes must be a number >= 15" });
+    return;
+  }
+  if (!requireAnakinApiKey(res)) return;
+
+  try {
+    const anakin = buildAnakinClient();
+    const monitor = await anakin.monitorCreate(url, intervalMinutes, rest);
+    res.status(201).json(redactSecrets(monitor));
+  } catch (err) {
+    logError("monitor create failed:", err.message);
+    res.status(502).json({ error: "anakin_api_error", message: err.message });
+  }
+});
+
+/** GET /api/monitors — list monitors. Redacted the same way as creation. */
+app.get("/api/monitors", requireInstallation, async (_req, res) => {
+  if (!requireAnakinApiKey(res)) return;
+  try {
+    const anakin = buildAnakinClient();
+    const result = await anakin.monitorList();
+    res.json(redactSecrets(result));
+  } catch (err) {
+    logError("monitor list failed:", err.message);
+    res.status(502).json({ error: "anakin_api_error", message: err.message });
+  }
+});
+
+/** GET /api/monitors/:id/changes — detected changes for one monitor. */
+app.get("/api/monitors/:id/changes", requireInstallation, async (req, res) => {
+  if (!requireAnakinApiKey(res)) return;
+  try {
+    const anakin = buildAnakinClient();
+    const result = await anakin.monitorChanges(req.params.id);
+    res.json(redactSecrets(result));
+  } catch (err) {
+    logError("monitor changes failed:", err.message);
+    res.status(502).json({ error: "anakin_api_error", message: err.message });
   }
 });
 
